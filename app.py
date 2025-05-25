@@ -1,32 +1,33 @@
-from flask import Flask, request, jsonify
-from flask.helpers import send_file
+from flask import Flask, request, jsonify, send_file
 import numpy as np
 import onnxruntime
-
 import cv2
 import json
 
-app = Flask(__name__,
-            static_url_path='/', 
-            static_folder='web')
+app = Flask(__name__, static_url_path='/', static_folder='web')
 
-ort_session = onnxruntime.InferenceSession("efficientnet-lite4-11.onnx")
+# Modelle vorbereiten
+MODELS = {
+    "EfficientNet-Lite4": "efficientnet-lite4-11.onnx",
+    "EfficientNet-Lite4-int8": "efficientnet-lite4-11-int8.onnx",
+    "EfficientNet-Lite4-qdq": "efficientnet-lite4-11-qdq.onnx",
+}
 
-# load the labels text file
+SESSIONS = {name: onnxruntime.InferenceSession(path) for name, path in MODELS.items()}
+
+# Labels laden
 labels = json.load(open("labels_map.txt", "r"))
 
-# set image file dimensions to 224x224 by resizing and cropping image from center
+# Preprocessing Funktionen
 def pre_process_edgetpu(img, dims):
     output_height, output_width, _ = dims
-    img = resize_with_aspectratio(img, output_height, output_width, inter_pol=cv2.INTER_LINEAR)
+    img = resize_with_aspectratio(img, output_height, output_width)
     img = center_crop(img, output_height, output_width)
     img = np.asarray(img, dtype='float32')
-    # converts jpg pixel value from [0 - 255] to float array [-1.0 - 1.0]
     img -= [127.0, 127.0, 127.0]
     img /= [128.0, 128.0, 128.0]
     return img
 
-# resize the image with a proportional scale
 def resize_with_aspectratio(img, out_height, out_width, scale=87.5, inter_pol=cv2.INTER_LINEAR):
     height, width, _ = img.shape
     new_height = int(100. * out_height / scale)
@@ -37,48 +38,44 @@ def resize_with_aspectratio(img, out_height, out_width, scale=87.5, inter_pol=cv
     else:
         h = new_height
         w = int(new_width * width / height)
-    img = cv2.resize(img, (w, h), interpolation=inter_pol)
-    return img
+    return cv2.resize(img, (w, h), interpolation=inter_pol)
 
-# crop the image around the center based on given height and width
 def center_crop(img, out_height, out_width):
     height, width, _ = img.shape
     left = int((width - out_width) / 2)
     right = int((width + out_width) / 2)
     top = int((height - out_height) / 2)
     bottom = int((height + out_height) / 2)
-    img = img[top:bottom, left:right]
-    return img
+    return img[top:bottom, left:right]
 
 @app.route("/")
 def indexPage():
-    # Haven't used the secure way to send files yet
-    return send_file("web/index.html")    
+    return send_file("web/index.html")
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-
-    # read the image
     content = request.files.get('0', '').read()
-
-    # build numpy array from uploaded data
-    img = cv2.imdecode(np.fromstring(content, np.uint8), cv2.IMREAD_UNCHANGED)
-
-    # pre-process, see https://github.com/onnx/models/tree/master/vision/classification/efficientnet-lite4
+    img = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_UNCHANGED)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # pre-process the image like mobilenet and resize it to 224x224
     img = pre_process_edgetpu(img, (224, 224, 3))
-
-    # create a batch of 1 (that batch size is buned into the saved_model)
     img_batch = np.expand_dims(img, axis=0)
 
-    # run inference
-    results = ort_session.run(["Softmax:0"], {"images:0": img_batch})[0]
-    result = reversed(results[0].argsort()[-5:])
+    results_all = {}
 
-    for r in result:
-        result_list = [{"class": labels[str(r)], "value": float(results[0][r])} for r in result]
+    for model_name, session in SESSIONS.items():
+        # ONNX Runtime expects exact input/output names
+        try:
+            result = session.run(["Softmax:0"], {"images:0": img_batch})[0]
+        except Exception:
+            result = session.run(None, {"images:0": img_batch})[0]
 
-    # Return the result as JSON
-    return jsonify(result_list)    
+        top_indices = result[0].argsort()[-3:][::-1]
+        results_all[model_name] = [
+            {"class": labels[str(i)], "value": float(result[0][i])}
+            for i in top_indices
+        ]
+
+    return jsonify(results_all)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=False)
